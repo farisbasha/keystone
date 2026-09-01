@@ -119,7 +119,7 @@ const task = await context.query.Task.createOne({
 })
 
 // Check that we can't update the task when logged in as Bob
-const { data, errors } = await context.withSession({ itemId: bob.id, data: {} }).graphql.raw({
+const { data, errors } = await context.withSession({ user: bob }).graphql.raw({
   query: `mutation update($id: ID!) {
       updateTask(where: { id: $id }, data: { isComplete: true }) {
         id
