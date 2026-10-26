@@ -34,7 +34,7 @@ import {
   type InputFilter,
   type UniqueInputFilter,
   resolveUniqueWhereInput,
-  resolveWhereInput,
+  resolveAccessFilterWhereInput,
 } from '../where-inputs.ts'
 import {
   RelationshipErrors,
@@ -59,13 +59,19 @@ async function getFilteredItem(
     throw accessDeniedError(cannotForItem(operation, list))
   }
 
-  // merge the filter access control and try to get the item
-  let where = mapUniqueWhereToWhere(uniqueWhere, list)
+  // check filter access before resolving, since resolving runs relationship access callbacks
+  await checkFilterOrderAccess(
+    [...traverse(list, uniqueWhere as UniqueInputFilter)],
+    context,
+    'filter'
+  )
 
-  await checkFilterOrderAccess([...traverse(list, where as any)], context, 'filter')
+  // merge the filter access control and try to get the item
+  let where = await mapUniqueWhereToWhere(uniqueWhere, list, context)
+  if (where === false) throw accessDeniedError(cannotForItem(operation, list))
 
   if (typeof accessFilters === 'object') {
-    where = { AND: [where, await resolveWhereInput(accessFilters, list, context)] }
+    where = { AND: [where, await resolveAccessFilterWhereInput(accessFilters, list, context)] }
   }
 
   const item = await context.prisma[list.listKey].findFirst({

@@ -14,6 +14,10 @@ import {
   type InputFilter,
   resolveUniqueWhereInput,
   resolveWhereInput,
+  resolveAccessFilterWhereInput,
+  getRelationshipFilterAccess,
+  applyRelationshipFilterAccess,
+  type RelationshipFilterAccessCache,
 } from '../where-inputs.ts'
 
 import { limitsExceededError, userInputError } from '../graphql-errors.ts'
@@ -37,12 +41,42 @@ function selectForQuery(
 // we want to put the value we get back from the field's unique where resolver into an equals
 // rather than directly passing the value as the filter (even though Prisma supports that), we use equals
 // because we want to disallow fields from providing an arbitrary filter
-export function mapUniqueWhereToWhere(uniqueWhere: UniquePrismaFilter, list: InitialisedList) {
+// returns false when a relationship in the selector is inaccessible, so nothing can match
+export function mapUniqueWhereToWhere(
+  uniqueWhere: UniquePrismaFilter,
+  list: InitialisedList,
+  context: KeystoneContext
+): Promise<PrismaFilter | false> {
+  return mapUniqueWhereToWhereWithAccess(uniqueWhere, list, context, new Map())
+}
+
+async function mapUniqueWhereToWhereWithAccess(
+  uniqueWhere: UniquePrismaFilter,
+  list: InitialisedList,
+  context: KeystoneContext,
+  relationshipAccessCache: RelationshipFilterAccessCache
+): Promise<PrismaFilter | false> {
   const where: PrismaFilter = {}
   for (const key in uniqueWhere) {
     if (list.fields[key].dbField.kind === 'relation') {
       const foreignList = list.lists[list.fields[key].dbField.list]
-      where[key] = mapUniqueWhereToWhere(uniqueWhere[key], foreignList)
+      const access = await getRelationshipFilterAccess(
+        foreignList,
+        context,
+        'one',
+        relationshipAccessCache
+      )
+      // the keys of a unique selector are combined with AND, so one inaccessible relationship
+      // means the whole selector matches nothing
+      if (access === false) return false
+      const foreignWhere = await mapUniqueWhereToWhereWithAccess(
+        uniqueWhere[key],
+        foreignList,
+        context,
+        relationshipAccessCache
+      )
+      if (foreignWhere === false) return false
+      where[key] = { is: applyRelationshipFilterAccess(foreignWhere, access) }
       continue
     }
     where[key] = { equals: uniqueWhere[key] }
@@ -84,7 +118,9 @@ export async function accessControlledFilter(
 ) {
   // Merge the filter access control
   if (typeof accessFilters === 'object') {
-    resolvedWhere = { AND: [resolvedWhere, await resolveWhereInput(accessFilters, list, context)] }
+    resolvedWhere = {
+      AND: [resolvedWhere, await resolveAccessFilterWhereInput(accessFilters, list, context)],
+    }
   }
 
   return resolvedWhere
@@ -103,15 +139,16 @@ export async function findOne(
   const accessFilters = await getAccessFilters(list, context, 'query', 'one')
   if (accessFilters === false) return null
 
+  // check filter access before resolving, since resolving runs relationship access callbacks
+  await checkFilterOrderAccess([...traverse(list, args.where)], context, 'filter')
+
   // validate and resolve the input filter
   const uniqueWhere = await resolveUniqueWhereInput(args.where, list, context)
-  const resolvedWhere = mapUniqueWhereToWhere(uniqueWhere, list)
+  const resolvedWhere = await mapUniqueWhereToWhere(uniqueWhere, list, context)
+  if (resolvedWhere === false) return null
 
   // findOne requires at least one filter
   if (Object.keys(resolvedWhere).length === 0) return null
-
-  // check filter access
-  await checkFilterOrderAccess([...traverse(list, args.where)], context, 'filter')
 
   // apply access control
   const filter = await accessControlledFilter(list, context, resolvedWhere, accessFilters)
@@ -153,10 +190,7 @@ export async function findMany(
   const accessFilters = await getAccessFilters(list, context, 'query', 'many')
   if (accessFilters === false) return []
 
-  // validate and resolve the input filter
-  const resolvedWhere = await resolveWhereInput(where, list, context)
-
-  // check filter access (TODO: why isn't this using resolvedWhere)
+  // check filter access before resolving, since resolving runs relationship access callbacks
   await checkFilterOrderAccess([...traverse(list, where)], context, 'filter')
 
   // check filter access for cursor
@@ -164,38 +198,67 @@ export async function findMany(
     await checkFilterOrderAccess([...traverse(list, cursor)], context, 'filter')
   }
 
+  // validate and resolve the input filter
+  const resolvedWhere = await resolveWhereInput(where, list, context)
+
   // WARNING: this checks .isOrderable
   const orderBy = await resolveOrderBy(rawOrderBy, list, context)
 
   // apply access control
   const resolvedAccessFilter =
-    accessFilters === true ? undefined : await resolveWhereInput(accessFilters, list, context)
+    accessFilters === true
+      ? undefined
+      : await resolveAccessFilterWhereInput(accessFilters, list, context)
   const filter =
     resolvedAccessFilter === undefined
       ? resolvedWhere
       : { AND: [resolvedWhere, resolvedAccessFilter] }
-  const query = context.prisma[list.listKey].findMany({
-    where: extraFilter === undefined ? filter : { AND: [filter, extraFilter] },
-    orderBy,
-    take: take ?? undefined,
-    skip,
-    cursor: cursor ?? undefined,
-    select: selectForQuery(list, select),
-  })
-  let results: BaseItem[]
-  if (cursor && resolvedAccessFilter !== undefined) {
-    // Prisma locates the cursor without the list's access filter. Check its visibility
-    // concurrently with fetching the page, and discard the page if the cursor is hidden.
-    const [cursorItem, items] = await Promise.all([
-      context.prisma[list.listKey].findFirst({
-        where: { AND: [mapUniqueWhereToWhere(cursor, list), resolvedAccessFilter] },
+  const pageFilter = extraFilter === undefined ? filter : { AND: [filter, extraFilter] }
+  const fetchPage = (cursor?: UniquePrismaFilter): Promise<BaseItem[]> =>
+    context.prisma[list.listKey].findMany({
+      where: pageFilter,
+      orderBy,
+      take: take ?? undefined,
+      skip,
+      cursor,
+      select: selectForQuery(list, select),
+    })
+  let prismaCursor: UniquePrismaFilter | undefined
+  let cursorFilter: PrismaFilter | undefined
+  let hasRelationshipCursor = false
+  if (cursor) {
+    prismaCursor = await resolveUniqueWhereInput(cursor, list, context)
+    hasRelationshipCursor = Object.keys(prismaCursor).some(
+      key => list.fields[key].dbField.kind === 'relation'
+    )
+    if (hasRelationshipCursor || resolvedAccessFilter !== undefined) {
+      const cursorWhere = await mapUniqueWhereToWhere(prismaCursor, list, context)
+      if (cursorWhere === false) return []
+      cursorFilter =
+        resolvedAccessFilter === undefined
+          ? cursorWhere
+          : { AND: [cursorWhere, resolvedAccessFilter] }
+    }
+  }
+  const cursorQuery = cursorFilter
+    ? context.prisma[list.listKey].findFirst({
+        where: cursorFilter,
         select: { id: true },
-      }),
-      query,
-    ])
+      })
+    : undefined
+  let results: BaseItem[]
+  if (hasRelationshipCursor) {
+    // Resolve relationship selectors to an accessible item ID before pagination,
+    // since Prisma cannot use relationship fields as cursor anchors.
+    const cursorItem = await cursorQuery
+    results = cursorItem === null ? [] : await fetchPage({ id: cursorItem.id })
+  } else if (cursorQuery) {
+    // Scalar cursors can fetch the page while checking visibility. Discard the
+    // page if the cursor is hidden by access filters.
+    const [cursorItem, items] = await Promise.all([cursorQuery, fetchPage(prismaCursor)])
     results = cursorItem === null ? [] : items
   } else {
-    results = await query
+    results = await fetchPage(prismaCursor)
   }
 
   if (list.cacheHint) {
@@ -277,10 +340,10 @@ export async function count(
   const accessFilters = await getAccessFilters(list, context, 'query', 'count')
   if (accessFilters === false) return 0
 
-  const resolvedWhere = await resolveWhereInput(where, list, context)
-
-  // check filter access (TODO: why isn't this using resolvedWhere)
+  // check filter access before resolving, since resolving runs relationship access callbacks
   await checkFilterOrderAccess([...traverse(list, where)], context, 'filter')
+
+  const resolvedWhere = await resolveWhereInput(where, list, context)
 
   const filter = await accessControlledFilter(list, context, resolvedWhere, accessFilters)
 
